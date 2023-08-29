@@ -1,20 +1,23 @@
-import sys, os
+import os, sys
 
 now_dir = os.getcwd()
 sys.path.append(os.path.join(now_dir))
-sys.path.append(os.path.join(now_dir, "train"))
-import utils
+
+from lib.train import utils
 import datetime
 
 hps = utils.get_hparams()
 os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
 n_gpus = len(hps.gpus.split("-"))
 from random import shuffle, randint
-import traceback, json, argparse, itertools, math, torch, pdb
+
+with open("loss_parameter.txt", "r") as file:
+    loss_parameter = file.readline().strip()
+
+import torch
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
-from torch import nn, optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -25,15 +28,13 @@ from torch.cuda.amp import autocast, GradScaler
 from lib.infer_pack import commons
 from time import sleep
 from time import time as ttime
-from data_utils import (
+from lib.train.data_utils import (
     TextAudioLoaderMultiNSFsid,
     TextAudioLoader,
     TextAudioCollateMultiNSFsid,
     TextAudioCollate,
     DistributedBucketSampler,
 )
-
-import csv
 
 if hps.version == "v1":
     from lib.infer_pack.models import (
@@ -47,9 +48,9 @@ else:
         SynthesizerTrnMs768NSFsid_nono as RVC_Model_nof0,
         MultiPeriodDiscriminatorV2 as MultiPeriodDiscriminator,
     )
-from losses import generator_loss, discriminator_loss, feature_loss, kl_loss
-from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
-from process_ckpt import savee
+from lib.train.losses import generator_loss, discriminator_loss, feature_loss, kl_loss
+from lib.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+from lib.train.process_ckpt import savee
 
 global_step = 0
 
@@ -69,7 +70,12 @@ class EpochRecorder:
 
 def main():
     n_gpus = torch.cuda.device_count()
+
     if torch.cuda.is_available() == False and torch.backends.mps.is_available() == True:
+        n_gpus = 1
+    if n_gpus < 1:
+        # patch to unblock people without gpus. there is probably a better way.
+        print("NO GPU DETECTED: falling back to CPU - this may take a while")
         n_gpus = 1
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(randint(20000, 55555))
@@ -352,7 +358,6 @@ def train_and_evaluate(
 
     # Run steps
     epoch_recorder = EpochRecorder()
-
     for batch_idx, info in data_iterator:
         # Data
         ## Unpack
@@ -519,8 +524,8 @@ def train_and_evaluate(
         global_step += 1
     # /Run steps
 
-    if epoch % hps.save_every_epoch == 0 and rank == 0:
-        if hps.if_latest == 0:
+    # if and epoch % hps.save_every_epoch == 0 and rank == 0:
+        if rank == 0 and epoch % hps.save_every_epoch == 0 and hps.if_latest == 0:
             utils.save_checkpoint(
                 net_g,
                 optim_g,
@@ -536,21 +541,22 @@ def train_and_evaluate(
                 os.path.join(hps.model_dir, "D_{}.pth".format(global_step)),
             )
         else:
-            utils.save_checkpoint(
-                net_g,
-                optim_g,
-                hps.train.learning_rate,
-                epoch,
-                os.path.join(hps.model_dir, "G_{}.pth".format(2333333)),
-            )
-            utils.save_checkpoint(
-                net_d,
-                optim_d,
-                hps.train.learning_rate,
-                epoch,
-                os.path.join(hps.model_dir, "D_{}.pth".format(2333333)),
-            )
-        if rank == 0 and hps.save_every_weights == "1":
+            if rank == 0 and epoch % hps.save_every_epoch == 0:
+                utils.save_checkpoint(
+                    net_g,
+                    optim_g,
+                    hps.train.learning_rate,
+                    epoch,
+                    os.path.join(hps.model_dir, "G_{}.pth".format(2333333)),
+                )
+                utils.save_checkpoint(
+                    net_d,
+                    optim_d,
+                    hps.train.learning_rate,
+                    epoch,
+                    os.path.join(hps.model_dir, "D_{}.pth".format(2333333)),
+                )
+        if rank == 0 and hps.save_every_weights == "1" and eval(loss_parameter):
             if hasattr(net_g, "module"):
                 ckpt = net_g.module.state_dict()
             else:
@@ -572,48 +578,6 @@ def train_and_evaluate(
                 )
             )
 
-    try:
-        with open("csvdb/stop.csv") as CSVStop:
-            csv_reader = list(csv.reader(CSVStop))
-            stopbtn = (
-                csv_reader[0][0]
-                if csv_reader is not None
-                else (lambda: exec('raise ValueError("No data")'))()
-            )
-            stopbtn = (
-                lambda stopbtn: True
-                if stopbtn.lower() == "true"
-                else (False if stopbtn.lower() == "false" else stopbtn)
-            )(stopbtn)
-    except (ValueError, TypeError, IndexError):
-        stopbtn = False
-
-    if stopbtn:
-        logger.info("Stop Button was pressed. The program is closed.")
-        if hasattr(net_g, "module"):
-            ckpt = net_g.module.state_dict()
-        else:
-            ckpt = net_g.state_dict()
-        logger.info(
-            "saving final ckpt:%s"
-            % (
-                savee(
-                    ckpt,
-                    hps.sample_rate,
-                    hps.if_f0,
-                    hps.name,
-                    epoch,
-                    hps.version,
-                    hps,
-                )
-            )
-        )
-        sleep(1)
-        with open("csvdb/stop.csv", "w+", newline="") as STOPCSVwrite:
-            csv_writer = csv.writer(STOPCSVwrite, delimiter=",")
-            csv_writer.writerow(["False"])
-        os._exit(2333333)
-
     if rank == 0:
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
     if epoch >= hps.total_epoch and rank == 0:
@@ -632,9 +596,6 @@ def train_and_evaluate(
             )
         )
         sleep(1)
-        with open("csvdb/stop.csv", "w+", newline="") as STOPCSVwrite:
-            csv_writer = csv.writer(STOPCSVwrite, delimiter=",")
-            csv_writer.writerow(["False"])
         os._exit(2333333)
 
 

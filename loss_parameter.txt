@@ -1,0 +1,1 @@
+loss_gen <= 3 and loss_kl <= 1.5
