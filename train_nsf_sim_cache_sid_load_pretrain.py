@@ -1,23 +1,28 @@
-import os, sys
+import sys, os
+import glob
+import torch
 
 now_dir = os.getcwd()
 sys.path.append(os.path.join(now_dir))
-
-from lib.train import utils
+sys.path.append(os.path.join(now_dir, "train"))
+import utils
 import datetime
 
 hps = utils.get_hparams()
 os.environ["CUDA_VISIBLE_DEVICES"] = hps.gpus.replace("-", ",")
 n_gpus = len(hps.gpus.split("-"))
 from random import shuffle, randint
+import traceback, json, argparse, itertools, math, torch, pdb
 
 with open("loss_parameter.txt", "r") as file:
     loss_parameter = file.readline().strip()
 
-import torch
+with open('pthfiles_max.txt', 'r') as file:
+    pthnamemax_files = int(file.read().strip())
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+from torch import nn, optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -28,13 +33,15 @@ from torch.cuda.amp import autocast, GradScaler
 from lib.infer_pack import commons
 from time import sleep
 from time import time as ttime
-from lib.train.data_utils import (
+from data_utils import (
     TextAudioLoaderMultiNSFsid,
     TextAudioLoader,
     TextAudioCollateMultiNSFsid,
     TextAudioCollate,
     DistributedBucketSampler,
 )
+
+import csv
 
 if hps.version == "v1":
     from lib.infer_pack.models import (
@@ -48,9 +55,9 @@ else:
         SynthesizerTrnMs768NSFsid_nono as RVC_Model_nof0,
         MultiPeriodDiscriminatorV2 as MultiPeriodDiscriminator,
     )
-from lib.train.losses import generator_loss, discriminator_loss, feature_loss, kl_loss
-from lib.train.mel_processing import mel_spectrogram_torch, spec_to_mel_torch
-from lib.train.process_ckpt import savee
+from losses import generator_loss, discriminator_loss, feature_loss, kl_loss
+from mel_processing import mel_spectrogram_torch, spec_to_mel_torch
+from process_ckpt import savee
 
 global_step = 0
 
@@ -70,12 +77,7 @@ class EpochRecorder:
 
 def main():
     n_gpus = torch.cuda.device_count()
-
     if torch.cuda.is_available() == False and torch.backends.mps.is_available() == True:
-        n_gpus = 1
-    if n_gpus < 1:
-        # patch to unblock people without gpus. there is probably a better way.
-        print("NO GPU DETECTED: falling back to CPU - this may take a while")
         n_gpus = 1
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(randint(20000, 55555))
@@ -358,6 +360,7 @@ def train_and_evaluate(
 
     # Run steps
     epoch_recorder = EpochRecorder()
+
     for batch_idx, info in data_iterator:
         # Data
         ## Unpack
@@ -524,7 +527,7 @@ def train_and_evaluate(
         global_step += 1
     # /Run steps
 
-    # if and epoch % hps.save_every_epoch == 0 and rank == 0:
+    # if epoch % hps.save_every_epoch == 0 and rank == 0:
         if rank == 0 and epoch % hps.save_every_epoch == 0 and hps.if_latest == 0:
             utils.save_checkpoint(
                 net_g,
@@ -570,13 +573,78 @@ def train_and_evaluate(
                         ckpt,
                         hps.sample_rate,
                         hps.if_f0,
-                        hps.name + "_e%s_s%s" % (epoch, global_step),
+                        hps.name + "_e%s_s%s" % (epoch, global_step - 1),
                         epoch,
                         hps.version,
                         hps,
                     ),
                 )
             )
+            # 删除指定文件
+            weights_folder = "weights"  # weights文件夹路径
+            target_file_name = hps.name + "_e"  # 目标文件名
+
+            file_pattern = os.path.join(weights_folder, "*.pth")
+            files = sorted(glob.glob(file_pattern), key=lambda x: os.path.getctime(x))
+            files_count = len(files)
+
+            target_files_count = sum(target_file_name in os.path.basename(file) for file in files)
+            excess_files_count = target_files_count - pthnamemax_files
+
+            if excess_files_count > 0:
+                files_to_delete = []
+                for file_path in files:
+                    file_name = os.path.basename(file_path)
+                    if target_file_name in file_name:
+                        files_to_delete.append(file_path)
+
+                files_to_delete = sorted(files_to_delete, key=lambda x: os.path.getctime(x))
+
+                for i in range(excess_files_count):
+                    os.remove(files_to_delete[i])
+
+
+    try:
+        with open("csvdb/stop.csv") as CSVStop:
+            csv_reader = list(csv.reader(CSVStop))
+            stopbtn = (
+                csv_reader[0][0]
+                if csv_reader is not None
+                else (lambda: exec('raise ValueError("No data")'))()
+            )
+            stopbtn = (
+                lambda stopbtn: True
+                if stopbtn.lower() == "true"
+                else (False if stopbtn.lower() == "false" else stopbtn)
+            )(stopbtn)
+    except (ValueError, TypeError, IndexError):
+        stopbtn = False
+
+    if stopbtn:
+        logger.info("Stop Button was pressed. The program is closed.")
+        if hasattr(net_g, "module"):
+            ckpt = net_g.module.state_dict()
+        else:
+            ckpt = net_g.state_dict()
+        logger.info(
+            "saving final ckpt:%s"
+            % (
+                savee(
+                    ckpt,
+                    hps.sample_rate,
+                    hps.if_f0,
+                    hps.name,
+                    epoch,
+                    hps.version,
+                    hps,
+                )
+            )
+        )
+        sleep(1)
+        with open("csvdb/stop.csv", "w+", newline="") as STOPCSVwrite:
+            csv_writer = csv.writer(STOPCSVwrite, delimiter=",")
+            csv_writer.writerow(["False"])
+        os._exit(2333333)
 
     if rank == 0:
         logger.info("====> Epoch: {} {}".format(epoch, epoch_recorder.record()))
@@ -596,6 +664,9 @@ def train_and_evaluate(
             )
         )
         sleep(1)
+        with open("csvdb/stop.csv", "w+", newline="") as STOPCSVwrite:
+            csv_writer = csv.writer(STOPCSVwrite, delimiter=",")
+            csv_writer.writerow(["False"])
         os._exit(2333333)
 
 
